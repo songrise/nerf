@@ -20,6 +20,7 @@ def to8b(x): return (255*np.clip(x, 0, 1)).astype(np.uint8)
 # Positional encoding
 
 class Embedder:
+    #! Re should be the \gamma for positional encoding?
 
     def __init__(self, **kwargs):
 
@@ -78,7 +79,7 @@ def get_embedder(multires, i=0):
 # Model architecture
 
 def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
-
+    #!Re see p.18 of the paper for the model architecture
     relu = tf.keras.layers.ReLU()
     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
 
@@ -100,6 +101,7 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
             outputs = tf.concat([inputs_pts, outputs], -1)
 
     if use_viewdirs:
+        # !Re alpha is view-independent, if not used, then it simulates Lambertian。
         alpha_out = dense(1, act=None)(outputs)
         bottleneck = dense(256, act=None)(outputs)
         inputs_viewdirs = tf.concat(
