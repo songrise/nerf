@@ -102,17 +102,20 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
 
     if use_viewdirs:
         # !Re alpha is view-independent, if not used, then it simulates Lambertian。
-        alpha_out = dense(1, act=None)(outputs)
+        alpha_out = dense(1, act=None)(outputs)  # !Re shouldn't this be relu?
         bottleneck = dense(256, act=None)(outputs)
+        # !Re input view direction here
         inputs_viewdirs = tf.concat(
             [bottleneck, inputs_views], -1)  # concat viewdirs
         outputs = inputs_viewdirs
         # The supplement to the paper states there are 4 hidden layers here, but this is an error since
         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
+        # ! Re in CVPR paper, there is only one layer.
         for i in range(1):
             outputs = dense(W//2)(outputs)
+        # !Re: rgb, shoudn't this be sigmoid?
         outputs = dense(3, act=None)(outputs)
-        outputs = tf.concat([outputs, alpha_out], -1)
+        outputs = tf.concat([outputs, alpha_out], -1)  # !Re rgba
     else:
         outputs = dense(output_ch, act=None)(outputs)
 
@@ -124,12 +127,21 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
 
 def get_rays(H, W, focal, c2w):
     """Get ray origins, directions from a pinhole camera."""
+    #!Re: c2w is the camera to world matrix, which is the inverse of the world to camera matrix.
+    #!Re: https://en.wikipedia.org/wiki/Pinhole_camera_model
     i, j = tf.meshgrid(tf.range(W, dtype=tf.float32),
                        tf.range(H, dtype=tf.float32), indexing='xy')
+    #!Re multiply by .5 is just dividing by 2.
+    #!Re i,j is the mapped into [-W/2, W/2], see pinhole camera model for intuition.
+    #!Re dirs are the normalized ray directions in camera space. the z axis is fixed.
     dirs = tf.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -tf.ones_like(i)], -1)
+    #!Re: c2w[:3, :3] is rotation part of the camera to world matrix.
     rays_d = tf.reduce_sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    #! Re: c2w[:3, -1] is the translation part.
     rays_o = tf.broadcast_to(c2w[:3, -1], tf.shape(rays_d))
     return rays_o, rays_d
+
+#!Re see https://github.com/bmild/nerf/issues/92
 
 
 def get_rays_np(H, W, focal, c2w):
@@ -160,6 +172,7 @@ def ndc_rays(H, W, focal, near, rays_o, rays_d):
       rays_d: array of shape [batch_size, 3]. Ray direction in NDC.
     """
     # Shift ray origins to near plane
+    #!Re todo check this later.
     t = -(near + rays_o[..., 2]) / rays_d[..., 2]
     rays_o = rays_o + t[..., None] * rays_d
 
@@ -186,15 +199,18 @@ def sample_pdf(bins, weights, N_samples, det=False):
 
     # Get pdf
     weights += 1e-5  # prevent nans
+    #! Re normalize
     pdf = weights / tf.reduce_sum(weights, -1, keepdims=True)
     cdf = tf.cumsum(pdf, -1)
     cdf = tf.concat([tf.zeros_like(cdf[..., :1]), cdf], -1)
 
     # Take uniform samples
     if det:
+        #! Re if deterministic, then take uniform samples
         u = tf.linspace(0., 1., N_samples)
         u = tf.broadcast_to(u, list(cdf.shape[:-1]) + [N_samples])
     else:
+        #!Re else take samples from uniform distribution
         u = tf.random.uniform(list(cdf.shape[:-1]) + [N_samples])
 
     # Invert CDF

@@ -713,6 +713,7 @@ def train():
     global_step.assign(start)
 
     # Prepare raybatch tensor if batching random rays
+    #!Re emit rays here.
     N_rand = args.N_rand
     use_batching = not args.no_batching
     if use_batching:
@@ -807,6 +808,7 @@ def train():
         with tf.GradientTape() as tape:
 
             # Make predictions for color, disparity, accumulated opacity.
+        
             rgb, disp, acc, extras = render(
                 H, W, focal, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
@@ -884,7 +886,7 @@ def train():
 
             if i % args.i_img == 0:
 
-                # Log a rendered validation view to Tensorboard
+                # Log a rendered validation view t  o Tensorboard
                 img_i = np.random.choice(i_val)
                 target = images[img_i]
                 pose = poses[img_i, :3, :4]
