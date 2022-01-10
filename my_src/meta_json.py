@@ -14,7 +14,7 @@ def gen_json(t):
         for line in log.split('\n'):
             try:
                 record = {"file_path": "{}}_{:04d}".format(t,
-                                                           line_cnt), "rotation": 0.6, "transform_matrix": eval(line)}
+                                                           line_cnt), "rotation": 4.0, "transform_matrix": eval(line)}
             except:
                 pass
             frames.append(record)
@@ -24,5 +24,5 @@ def gen_json(t):
         data_json = json.dumps(data)
         with open('Screenshots/Screenshoot_meta.json', 'w') as ff:
             ff.write(data_json)
-#%%
+# %%
 # %%

@@ -186,7 +186,7 @@ def render_rays(ray_batch,
         # Sample linearly in inverse depth (disparity).
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
     z_vals = tf.broadcast_to(z_vals, [N_rays, N_samples])
-
+    #! Re sample pts along each ray.
     # Perturb sampling time along each ray.
     if perturb > 0.:
         # get intervals between samples
@@ -202,6 +202,7 @@ def render_rays(ray_batch,
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
     # Evaluate model at each point.
+    #! Re inference here
     raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d)
@@ -297,6 +298,7 @@ def render(H, W, focal,
         # provide ray directions as input
         viewdirs = rays_d
         if c2w_staticcam is not None:
+            #! Re what is it
             # special case to visualize effect of viewdirs
             rays_o, rays_d = get_rays(H, W, focal, c2w_staticcam)
 
@@ -808,7 +810,7 @@ def train():
         with tf.GradientTape() as tape:
 
             # Make predictions for color, disparity, accumulated opacity.
-        
+
             rgb, disp, acc, extras = render(
                 H, W, focal, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)

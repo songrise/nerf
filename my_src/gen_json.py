@@ -18,7 +18,7 @@ def gen_json(t):
 
             try:
                 record = {"file_path": "./{}/{:04d}_shot".format(
-                    t, line_cnt), "rotation": 0.6, "transform_matrix": eval(line)}
+                    t, line_cnt), "rotation": 4.0, "transform_matrix": eval(line)}
                 frames.append(record)
             except Exception as e:
                 print(e)

@@ -1,9 +1,16 @@
+# -*- coding : utf-8 -*-
+# @FileName  : compare_png.py
+# @Author    : Ruixiang JIANG (Songrise)
+# @Time      : 2022-01-02
+# @Github    ：https://github.com/songrise
+# @Descriptions: compare the difference between two png files
+
 # %%
 import numpy as np
 import imageio
 import os
 # my data
-fname = "0200_shot.png"
+fname = "0000_shot.png"
 # official data
 # fname = "r_0.png"
 fname = os.path.join(fname)
@@ -18,5 +25,6 @@ print(imgs[0, 0])
 # %%center
 print(imgs[400, 400])
 # %%
-
+for i in range(10):
+    print(imgs[i,0])
 # %%

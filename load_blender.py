@@ -79,6 +79,7 @@ def load_blender_data(basedir, half_res=False, testskip=1):
     H, W = imgs[0].shape[:2]
     camera_angle_x = float(meta['camera_angle_x'])
     #! Re what is the .5?
+    #! Re it should be divied by 2
     focal = .5 * W / np.tan(.5 * camera_angle_x)
 
     #! Re the poses used for visualization later.
