@@ -1,3 +1,4 @@
+# %%
 import os
 import sys
 import tensorflow as tf
@@ -60,6 +61,7 @@ class Embedder:
 def get_embedder(multires, i=0):
 
     if i == -1:
+        # return itself without any embedding
         return tf.identity, 3
 
     embed_kwargs = {
@@ -78,6 +80,51 @@ def get_embedder(multires, i=0):
 
 # Model architecture
 
+# def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+#     #!Re see p.18 of the paper for the model architecture
+#     relu = tf.keras.layers.ReLU()
+#     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
+
+#     print('MODEL', input_ch, input_ch_views, type(
+#         input_ch), type(input_ch_views), use_viewdirs)
+#     input_ch = int(input_ch)
+#     input_ch_views = int(input_ch_views)
+
+#     inputs = tf.keras.Input(shape=(input_ch + input_ch_views))
+#     inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
+#     inputs_pts.set_shape([None, input_ch])
+#     inputs_views.set_shape([None, input_ch_views])
+
+#     print(inputs.shape, inputs_pts.shape, inputs_views.shape)
+#     outputs = inputs_pts
+#     for i in range(D):
+#         outputs = dense(W)(outputs)
+#         if i in skips:
+#             outputs = tf.concat([inputs_pts, outputs], -1)
+
+#     if use_viewdirs:
+#         # !Re alpha is view-independent, if not used, then it simulates Lambertian。
+#         alpha_out = dense(1, act=None)(outputs)  # !Re shouldn't this be relu?
+#         bottleneck = dense(256, act=None)(outputs)
+#         # !Re input view direction here
+#         inputs_viewdirs = tf.concat(
+#             [bottleneck, inputs_views], -1)  # concat viewdirs
+#         outputs = inputs_viewdirs
+#         # The supplement to the paper states there are 4 hidden layers here, but this is an error since
+#         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
+#         # ! Re in CVPR paper, there is only one layer.
+#         for i in range(1):
+#             outputs = dense(W//2)(outputs)
+#         # !Re: rgb, shoudn't this be sigmoid?
+#         outputs = dense(3, act=None)(outputs)
+#         outputs = tf.concat([outputs, alpha_out], -1)  # !Re rgb+a
+#     else:
+#         outputs = dense(output_ch, act=None)(outputs)
+
+#     model = tf.keras.Model(inputs=inputs, outputs=outputs)
+#     return model
+
+# modified architecture
 def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
     #!Re see p.18 of the paper for the model architecture
     relu = tf.keras.layers.ReLU()
@@ -102,7 +149,8 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
 
     if use_viewdirs:
         # !Re alpha is view-independent, if not used, then it simulates Lambertian。
-        alpha_out = dense(1, act=None)(outputs)  # !Re shouldn't this be relu?
+        # !Re shouldn't this be relu? (solved, relu is in later functions)
+        alpha_out = dense(1, act=None)(outputs)
         bottleneck = dense(256, act=None)(outputs)
         # !Re input view direction here
         inputs_viewdirs = tf.concat(
@@ -111,19 +159,19 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
         # The supplement to the paper states there are 4 hidden layers here, but this is an error since
         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
         # ! Re in CVPR paper, there is only one layer.
-        for i in range(1):
+        for i in range(4):  # !Re: Modified for 4 layers in order to get better view-dependent results
             outputs = dense(W//2)(outputs)
         # !Re: rgb, shoudn't this be sigmoid?
         outputs = dense(3, act=None)(outputs)
-        outputs = tf.concat([outputs, alpha_out], -1)  # !Re rgba
+        outputs = tf.concat([outputs, alpha_out], -1)  # !Re rgb+a
     else:
         outputs = dense(output_ch, act=None)(outputs)
 
     model = tf.keras.Model(inputs=inputs, outputs=outputs)
     return model
 
-
 # Ray helpers
+
 
 def get_rays(H, W, focal, c2w):
     """Get ray origins, directions from a pinhole camera."""
@@ -146,12 +194,35 @@ def get_rays(H, W, focal, c2w):
 
 def get_rays_np(H, W, focal, c2w):
     """Get ray origins, directions from a pinhole camera."""
+    if None:
+        return get_rays_np_sub_pix(H, W, focal, c2w)
+
     i, j = np.meshgrid(np.arange(W, dtype=np.float32),
                        np.arange(H, dtype=np.float32), indexing='xy')
     dirs = np.stack([(i-W*.5)/focal, -(j-H*.5)/focal, -np.ones_like(i)], -1)
     rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
     rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
     return rays_o, rays_d
+
+
+def get_rays_np_sub_pix(H, W, focal, c2w):
+    """
+    Get ray origins, directions from a pinhole camera.
+    Sample 4 rays for a single pixel
+    """
+    i, j = np.meshgrid(np.arange(2*W, dtype=np.float32),
+                       np.arange(2*H, dtype=np.float32), indexing='xy')
+    dirs = np.stack([(i-W)/(focal), -(j-H) /
+                     (focal), -np.ones_like(i)], -1)
+    rays_d = np.sum(dirs[..., np.newaxis, :] * c2w[:3, :3], -1)
+    # just divide them by 2 since the rays are centered wrt the principal ray
+    rays_d /= np.array([2, 2, 1])
+    rays_o = np.broadcast_to(c2w[:3, -1], np.shape(rays_d))
+    return rays_o, rays_d
+
+
+a = get_rays_np_sub_pix(2, 2, 0.5, np.array(
+    [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]))
 
 
 def ndc_rays(H, W, focal, near, rays_o, rays_d):
@@ -214,6 +285,7 @@ def sample_pdf(bins, weights, N_samples, det=False):
         u = tf.random.uniform(list(cdf.shape[:-1]) + [N_samples])
 
     # Invert CDF
+    #!Re index of the bin
     inds = tf.searchsorted(cdf, u, side='right')
     below = tf.maximum(0, inds-1)
     above = tf.minimum(cdf.shape[-1]-1, inds)
@@ -227,3 +299,11 @@ def sample_pdf(bins, weights, N_samples, det=False):
     samples = bins_g[..., 0] + t * (bins_g[..., 1]-bins_g[..., 0])
 
     return samples
+
+
+# %%
+if __name__ == "__main__":
+    rays = [get_rays_np_sub_pix(4, 4, 0.5, np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])) for _ in range(16)]
+    rays = np.stack(rays, 0)
+# %%

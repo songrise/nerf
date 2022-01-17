@@ -277,7 +277,7 @@ def render(H, W, focal,
       near: float or array of shape [batch_size]. Nearest distance for a ray.
       far: float or array of shape [batch_size]. Farthest distance for a ray.
       use_viewdirs: bool. If True, use viewing direction of a point in space in model.
-      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
+      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for
        camera while using other c2w argument for viewing directions.
 
     Returns:
@@ -352,6 +352,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     t = time.time()
     for i, c2w in enumerate(render_poses):
+        #! Re for each of the poses to render
         print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(
@@ -369,7 +370,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
-
+    #! Re prediction for each poses
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
 
@@ -573,6 +574,18 @@ def config_parser():
     return parser
 
 
+def gen_mask(rgba, threshold: float = 0.01):
+    """genearate object mask for img of [H, W, 4], assuming rgba is in [0, 1], and the background is pure white
+      return a mask of [H, W], 0 from 0~1, 0 for background, 1 for object
+    """
+    mask = tf.reduce_sum(rgba, -1) < threshold
+    # invert mask
+    mask = tf.cast(mask, tf.float32)
+    mask = 1. - mask
+
+    return mask
+
+
 def train():
 
     parser = config_parser()
@@ -730,9 +743,14 @@ def train():
         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
         # for each pixel in the image. This stack() adds a new dimension.
         rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
-        rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
+        # [N, ro+rd, H, W, 3] (!Re [N, 2, H, W, 3])
+        rays = np.stack(rays, axis=0)
         print('done, concats')
         # [N, ro+rd+rgb, H, W, 3]
+        #! Re associate rays with rgb.
+        #! 2X upsample images to match rays dimensions.
+        images = np.stack([np.repeat(np.repeat(images, 2, axis=0), 2, axis=1)])
+
         rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
         # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
@@ -780,8 +798,8 @@ def train():
             # Random from one image
             img_i = np.random.choice(i_train)
             target = images[img_i]
+            target_mask = gen_mask(target, 4-1e-3)
             pose = poses[img_i, :3, :4]
-
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, focal, pose)
                 if i < args.precrop_iters:
@@ -804,9 +822,12 @@ def train():
                 rays_d = tf.gather_nd(rays_d, select_inds)
                 batch_rays = tf.stack([rays_o, rays_d], 0)
                 target_s = tf.gather_nd(target, select_inds)
+                target_mask_s = tf.gather_nd(target_mask, select_inds)
 
         #####  Core optimization loop  #####
-
+        #!Re define loss coefficient
+        l_rgb = 0.5
+        l_struct = 1.-l_rgb
         with tf.GradientTape() as tape:
 
             # Make predictions for color, disparity, accumulated opacity.
@@ -816,10 +837,14 @@ def train():
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
-            img_loss = img2mse(rgb, target_s)
+            # img_loss = img2mse(rgb, target_s)
+            rgb_loss = tf.reduce_mean(tf.square(rgb - target_s))
+            struct_loss = tf.reduce_mean(tf.square(acc - target_mask_s))
+
             trans = extras['raw'][..., -1]
-            loss = img_loss
-            psnr = mse2psnr(img_loss)
+            # loss = l_rgb*rgb_loss + l_struct*struct_loss
+            loss = rgb_loss
+            psnr = mse2psnr(rgb_loss)
 
             # Add MSE loss for coarse-grained model
             if 'rgb0' in extras:
@@ -859,6 +884,7 @@ def train():
                              to8b(disps / np.max(disps)), fps=30, quality=8)
 
             if args.use_viewdirs:
+                #! Re use the same poses for the viewdirs
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
                 rgbs_still, _ = render_path(
                     render_poses, hwf, args.chunk, render_kwargs_test)
