@@ -78,6 +78,64 @@ def get_embedder(multires, i=0):
     return embed, embedder_obj.out_dim
 
 
+class SphericalBasis(tf.keras.Model):
+    def __init__(self, n_order=8, inputch_views=27, **kwargs):
+        """
+        Args:
+            n_order: the order of the basis function
+        """
+        super(SphericalBasis, self).__init__()
+        self.n_order = n_order
+        self.basis = []
+        for _ in range(n_order):
+            if _ <= n_order//4:
+                self.basis.append(self.create_basis(
+                    inputch_views=inputch_views, width=8))
+            elif _ <= n_order//2:
+                self.basis.append(self.create_basis(
+                    inputch_views=inputch_views, width=32))
+            else:
+                self.basis.append(self.create_basis(
+                    inputch_views=inputch_views, width=64))
+
+    def call(self, inputs,  coeff=None):
+        """
+        Args:
+            inputs: the embedded view direction
+            coeff: the coefficients of the basis function [batch_size, n_order, 1]
+        Returns:
+            rgb: (None, 3) predicted rgb in the range [-1, 1]
+        """
+        if coeff is None:
+            coeff = tf.ones_like(inputs)
+            print("coeff is empty")
+
+        # duplicate the coeff for 3 channels
+        coeff = tf.tile(tf.expand_dims(coeff, axis=2), [1, 1, 3])
+
+        x = inputs
+        rgb = self.basis[0](x)
+
+        for i in range(1, self.n_order):
+            # linear combination of basis functions
+            rgb += coeff[:, i]*self.basis[i](x)
+        # rgb in [-1, 1] since the view-dependent effect maybe black
+        # rgb = tf.keras.activations.(rgb)
+        return rgb
+
+    def create_basis(self, width=8, inputch_views=27):
+        """
+        Create the basis function
+        """
+        basis = tf.keras.Sequential([
+            tf.keras.layers.Dense(width, activation='relu',
+                                  input_shape=(inputch_views,)),
+            tf.keras.layers.Dense(width, activation='relu'),
+            tf.keras.layers.Dense(3, activation=None)
+        ])
+        return basis
+
+
 # Model architecture
 
 # def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
@@ -124,7 +182,56 @@ def get_embedder(multires, i=0):
 #     model = tf.keras.Model(inputs=inputs, outputs=outputs)
 #     return model
 
-# modified architecture
+# # modified architecture
+# def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
+#     #!Re see p.18 of the paper for the model architecture
+#     relu = tf.keras.layers.ReLU()
+#     def dense(W, act=relu): return tf.keras.layers.Dense(W, activation=act)
+
+#     print('MODEL', input_ch, input_ch_views, type(
+#         input_ch), type(input_ch_views), use_viewdirs)
+#     input_ch = int(input_ch)
+#     input_ch_views = int(input_ch_views)
+
+#     inputs = tf.keras.Input(shape=(input_ch + input_ch_views))
+#     inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
+#     inputs_pts.set_shape([None, input_ch])
+#     inputs_views.set_shape([None, input_ch_views])
+
+#     print(inputs.shape, inputs_pts.shape, inputs_views.shape)
+#     outputs = inputs_pts
+#     for i in range(D):
+#         outputs = dense(W)(outputs)
+#         if i in skips:
+#             outputs = tf.concat([inputs_pts, outputs], -1)
+#     n_order = 8  # neural expansion order
+#     if use_viewdirs:
+#         #! Re modified this following NeX and refNerf
+#         alpha_out = dense(1, act=None)(outputs)
+#         diffuse_out = dense(3, act="sigmoid")(outputs)
+#         bottleneck = dense(256, act=None)(outputs)
+
+#         inputs_viewdirs = tf.concat(
+#             [bottleneck, inputs_views], -1)  # concat viewdirs
+#         outputs = inputs_viewdirs
+#         # The supplement to the paper states there are 4 hidden layers here, but this is an error since
+#         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
+#         for i in range(1):  # !Re: Modified for 4 layers in order to get better view-dependent results
+#             outputs = dense(W//2)(outputs)
+
+#         outputs = dense(n_order, act=None)(outputs)  # coeff
+#         basis = SphericalBasis(n_order, input_ch_views)
+#         outputs = basis(inputs_views, coeff=outputs)  # specular
+#         outputs = diffuse_out + outputs  # diffuse + specular
+#         outputs = tf.concat([outputs, alpha_out], -1)  # !Re rgb+a
+#     else:
+#         outputs = dense(output_ch, act=None)(outputs)
+
+#     model = tf.keras.Model(inputs=inputs, outputs=outputs)
+#     return model
+
+
+# modified architecture v2
 def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
     #!Re see p.18 of the paper for the model architecture
     relu = tf.keras.layers.ReLU()
@@ -146,23 +253,25 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
         outputs = dense(W)(outputs)
         if i in skips:
             outputs = tf.concat([inputs_pts, outputs], -1)
-
+    n_order = 8  # neural expansion order
     if use_viewdirs:
-        # !Re alpha is view-independent, if not used, then it simulates Lambertian。
-        # !Re shouldn't this be relu? (solved, relu is in later functions)
+        #! Re modified this following NeX and refNerf
         alpha_out = dense(1, act=None)(outputs)
+        diffuse_out = dense(3, act=None)(outputs)
         bottleneck = dense(256, act=None)(outputs)
-        # !Re input view direction here
+
         inputs_viewdirs = tf.concat(
             [bottleneck, inputs_views], -1)  # concat viewdirs
         outputs = inputs_viewdirs
         # The supplement to the paper states there are 4 hidden layers here, but this is an error since
         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
-        # ! Re in CVPR paper, there is only one layer.
-        for i in range(4):  # !Re: Modified for 4 layers in order to get better view-dependent results
-            outputs = dense(W//2)(outputs)
-        # !Re: rgb, shoudn't this be sigmoid?
-        outputs = dense(3, act=None)(outputs)
+        for i in range(1):  # !Re: Modified for 4 layers in order to get better view-dependent results
+            outputs = dense(W)(outputs)
+
+        outputs = dense(n_order, act=None)(outputs)  # coeff
+        basis = SphericalBasis(n_order, input_ch_views)
+        outputs = basis(inputs_views, coeff=outputs)  # specular
+        outputs = diffuse_out + outputs  # diffuse + specular
         outputs = tf.concat([outputs, alpha_out], -1)  # !Re rgb+a
     else:
         outputs = dense(output_ch, act=None)(outputs)
