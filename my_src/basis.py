@@ -44,9 +44,8 @@ import matplotlib.pyplot as plt
 #         x = self.rgb_intensity(x)
 #         return x
 
-
 class SphericalBasis(tf.keras.Model):
-    def __init__(self, n_order=8):
+    def __init__(self, n_order=8, inputch_views=27, **kwargs):
         """
         Args:
             n_order: the order of the basis function
@@ -55,52 +54,54 @@ class SphericalBasis(tf.keras.Model):
         self.n_order = n_order
         self.basis = []
         for _ in range(n_order):
-            if _ < n_order//4:
-                self.basis.append(self.create_basis(width=4))
-            elif _ < n_order//2:
-                self.basis.append(self.create_basis(width=16))
+            if _ <= n_order//4:
+                self.basis.append(self.create_basis(
+                    inputch_views=inputch_views, width=8))
+            elif _ <= n_order//2:
+                self.basis.append(self.create_basis(
+                    inputch_views=inputch_views, width=32))
+            elif _ < n_order-1:
+                self.basis.append(self.create_basis(
+                    inputch_views=inputch_views, width=64))
             else:
-                self.basis.append(self.create_basis(width=32))
+                self.basis.append(self.create_basis(
+                    inputch_views=inputch_views, width=128))
 
     def call(self, inputs,  coeff=None):
         """
         Args:
-            inputs: the embedded view direction, shape = (batch_size, n_order)
-            coeff: the coefficients of the basis function
+            inputs: the embedded view direction
+            coeff: the coefficients of the basis function [batch_size, n_order, 1]
         Returns:
             rgb: (None, 3) predicted rgb in the range [-1, 1]
         """
         if coeff is None:
             coeff = tf.ones_like(inputs)
             print("coeff is empty")
-        # duplicate the coeff to [batch_size, n_order, 3]
+
+        # duplicate the coeff for 3 channels
         coeff = tf.tile(tf.expand_dims(coeff, axis=2), [1, 1, 3])
+
         x = inputs
         rgb = self.basis[0](x)
-        print(x.shape)
-        print(rgb.shape)
-        print(coeff.shape)
 
         for i in range(1, self.n_order):
             # linear combination of basis functions
-            print("coeff shape: ", coeff[:, i].shape)
-            print("shape2: ", self.basis[i](x))
-            # linear combination of basis functions
             rgb += coeff[:, i]*self.basis[i](x)
-            rgb += coeff[..., i]*self.basis[i](x)
         # rgb in [-1, 1] since the view-dependent effect maybe black
-        rgb = tf.keras.activations.tanh(rgb)
+        # rgb = tf.keras.activations.(rgb)
         return rgb
 
-    def create_basis(self, width=4, n_order=8):
+    def create_basis(self, width=8, inputch_views=27):
         """
         Create the basis function
         """
         basis = tf.keras.Sequential([
-            tf.keras.layers.Dense(width, activation='relu',
-                                  input_shape=(n_order,)),
-            tf.keras.layers.Dense(width, activation='relu'),
-            tf.keras.layers.Dense(3, activation='sigmoid')
+            tf.keras.layers.Dense(width, activation=tf.keras.activations.elu,
+                                  input_shape=(inputch_views,)),
+            tf.keras.layers.Dense(
+                width, activation=tf.keras.activations.elu),
+            tf.keras.layers.Dense(3, activation=None)
         ])
         return basis
 

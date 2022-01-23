@@ -128,9 +128,9 @@ class SphericalBasis(tf.keras.Model):
         Create the basis function
         """
         basis = tf.keras.Sequential([
-            tf.keras.layers.Dense(width, activation='relu',
+            tf.keras.layers.Dense(width, activation=tf.keras.activations.elu,
                                   input_shape=(inputch_views,)),
-            tf.keras.layers.Dense(width, activation='relu'),
+            tf.keras.layers.Dense(width, activation=tf.keras.activations.elu),
             tf.keras.layers.Dense(3, activation=None)
         ])
         return basis
@@ -253,7 +253,7 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
         outputs = dense(W)(outputs)
         if i in skips:
             outputs = tf.concat([inputs_pts, outputs], -1)
-    n_order = 8  # neural expansion order
+    n_order = 12  # neural expansion order
     if use_viewdirs:
         #! Re modified this following NeX and refNerf
         alpha_out = dense(1, act=None)(outputs)
