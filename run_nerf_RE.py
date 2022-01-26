@@ -1,3 +1,10 @@
+# -*- coding : utf-8 -*-
+# @FileName  : run_nerf_RE.py
+# @Author    : Ruixiang JIANG (Songrise)
+# @Time      : 2022-01-26
+# @Github    ：https://github.com/songrise
+# @Descriptions: Remarks for run_nerf.py
+
 from load_blender import load_blender_data
 from load_deepvoxels import load_dv_data
 from load_llff import load_llff_data
@@ -18,6 +25,7 @@ tf.compat.v1.enable_eager_execution()
 
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches."""
+    #! fn: NeRF model
     if chunk is None:
         return fn
 
@@ -28,19 +36,29 @@ def batchify(fn, chunk):
 
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'."""
-
+    #! inputs: [N_rays, N_sample_points, 3]
     inputs_flat = tf.reshape(inputs, [-1, inputs.shape[-1]])
+    #! inputs_flat: [N_rays*N_sample_points, 3]
 
     embedded = embed_fn(inputs_flat)
+    #! embedded: [N_rays*N_sample_points, N_embed], depends on embed_fn
+    #!e.g, [65536, 3] -> [65536, 63]
     if viewdirs is not None:
         input_dirs = tf.broadcast_to(viewdirs[:, None], inputs.shape)
         input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+        #! input_dirs_flat: [N_rays*N_sample_points, 3], corresponds to inputs_flat
         embedded_dirs = embeddirs_fn(input_dirs_flat)
+        #! embedded_dirs: [N_rays*N_sample_points, N_embed], depends on embed_fn
+        #! the embed dim for view is not same as embed for position
+        #!e.g, [65536, 3] -> [65536, 27]
         embedded = tf.concat([embedded, embedded_dirs], -1)
+        #!e.g., [65536, 63+27]
 
     outputs_flat = batchify(fn, netchunk)(embedded)
+    #! outputs_flat: [N_rays*N_sample_points, 4], last dim rgba(raw)
     outputs = tf.reshape(outputs_flat, list(
         inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    #! outputs: [N_rays, N_sample_points, 4], last dim rgba(raw)
     return outputs
 
 
@@ -57,6 +75,7 @@ def render_rays(ray_batch,
                 raw_noise_std=0.,
                 verbose=False):
     """Volumetric rendering.
+
 
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -88,12 +107,16 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
-
+    #! this function takes a batch of rays and returns the predicted rgb and others for each ray
+    #! i.e, this function render a bunch of rays
     def raw2outputs(raw, z_vals, rays_d):
         """Transforms model's predictions to semantically meaningful values.
+        works for a bunch of rays and sample pts at once.
+        return the info associated with each ray.
 
         Args:
           raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+            last channel: rgba
           z_vals: [num_rays, num_samples along ray]. Integration time.
           rays_d: [num_rays, 3]. Direction of each ray.
 
@@ -121,6 +144,8 @@ def render_rays(ray_batch,
         # to convert to real world distance (accounts for non-unit directions).
         dists = dists * tf.linalg.norm(rays_d[..., None, :], axis=-1)
 
+        #! NOTICE: all "N_rays" below does not mean the rays in a picture.
+        #! it means the rays in a batch., e.g., 1024 by default.
         # Extract RGB of each sample position along each ray.
         rgb = tf.math.sigmoid(raw[..., :3])  # [N_rays, N_samples, 3]
 
@@ -142,6 +167,7 @@ def render_rays(ray_batch,
             tf.math.cumprod(1.-alpha + 1e-10, axis=-1, exclusive=True)
 
         # Computed weighted color of each sample along each ray.
+        #! i.e. coloar of each ray
         rgb_map = tf.reduce_sum(
             weights[..., None] * rgb, axis=-2)  # [N_rays, 3]
 
@@ -181,12 +207,14 @@ def render_rays(ray_batch,
     if not lindisp:
         # Space integration times linearly between 'near' and 'far'. Same
         # integration points will be used for all rays.
+        # ! distance of sample pts along each ray direction
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
         # Sample linearly in inverse depth (disparity).
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
+    #! the same integration times (distance) for all rays.
     z_vals = tf.broadcast_to(z_vals, [N_rays, N_samples])
-    #! Re sample pts along each ray.
+
     # Perturb sampling time along each ray.
     if perturb > 0.:
         # get intervals between samples
@@ -198,18 +226,22 @@ def render_rays(ray_batch,
         z_vals = lower + (upper - lower) * t_rand
 
     # Points in space to evaluate model at.
+    #! all sample points, None: add one dimension
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    #! after prev line, pts is [N_rays, N_samples, 3], last dim is raw position
 
     # Evaluate model at each point.
-    #! Re inference here
+    #! actually calling the model here. Evaluate a bunch of pts
     raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
+    #! convert per-point raw to per-ray rgb, disp, acc, weights, depth
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
         raw, z_vals, rays_d)
 
     if N_importance > 0:
+        # ! previous are pred of course network
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
-
+        #! below, pred again for fine network
         # Obtain additional integration times to evaluate based on the weights
         # assigned to colors in the coarse model.
         z_vals_mid = .5 * (z_vals[..., 1:] + z_vals[..., :-1])
@@ -227,17 +259,18 @@ def render_rays(ray_batch,
         raw = network_query_fn(pts, viewdirs, run_fn)
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
             raw, z_vals, rays_d)
-
+    #! if N_importance >0, then returned here is the pred of fine network
     ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
     if retraw:
         ret['raw'] = raw
-    if N_importance > 0:
+    if N_importance > 0:  # !also return the pred of coarse network, but different name
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
 
     for k in ret:
+        #! check is NaN or Inf
         tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
 
     return ret
@@ -277,7 +310,7 @@ def render(H, W, focal,
       near: float or array of shape [batch_size]. Nearest distance for a ray.
       far: float or array of shape [batch_size]. Farthest distance for a ray.
       use_viewdirs: bool. If True, use viewing direction of a point in space in model.
-      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for
+      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
        camera while using other c2w argument for viewing directions.
 
     Returns:
@@ -298,7 +331,6 @@ def render(H, W, focal,
         # provide ray directions as input
         viewdirs = rays_d
         if c2w_staticcam is not None:
-            #! Re what is it
             # special case to visualize effect of viewdirs
             rays_o, rays_d = get_rays(H, W, focal, c2w_staticcam)
 
@@ -325,12 +357,14 @@ def render(H, W, focal,
         # (ray origin, ray direction, min dist, max dist, normalized viewing direction)
         rays = tf.concat([rays, viewdirs], axis=-1)
 
-    # Render and reshape
+    # Render and reshape,
+    #! model called here
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
 
+    #! extract the outputs, here is the pred of fine network
     k_extract = ['rgb_map', 'disp_map', 'acc_map']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
@@ -352,7 +386,6 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     t = time.time()
     for i, c2w in enumerate(render_poses):
-        #! Re for each of the poses to render
         print(i, time.time() - t)
         t = time.time()
         rgb, disp, acc, _ = render(
@@ -370,7 +403,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
-    #! Re prediction for each poses
+
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
 
@@ -387,6 +420,7 @@ def create_nerf(args):
     if args.use_viewdirs:
         embeddirs_fn, input_ch_views = get_embedder(
             args.multires_views, args.i_embed)
+    #! This only used for no-view-dir
     output_ch = 4
     skips = [4]
     model = init_nerf_model(
@@ -447,7 +481,7 @@ def create_nerf(args):
     if len(ckpts) > 0 and not args.no_reload:
         ft_weights = ckpts[-1]
         print('Reloading from', ft_weights)
-        model.set_weights(np.load(ft_weights, allow_pickle=True))
+#         model.set_weights(np.load(ft_weights, allow_pickle=True))
         start = int(ft_weights[-10:-4]) + 1
         print('Resetting step to', start)
 
@@ -455,7 +489,7 @@ def create_nerf(args):
             ft_weights_fine = '{}_fine_{}'.format(
                 ft_weights[:-11], ft_weights[-10:])
             print('Reloading fine from', ft_weights_fine)
-            model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
+#             model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, models
 
@@ -574,18 +608,6 @@ def config_parser():
     return parser
 
 
-def gen_mask(rgba, threshold: float = 0.01):
-    """genearate object mask for img of [H, W, 4], assuming rgba is in [0, 1], and the background is pure white
-      return a mask of [H, W], 0 from 0~1, 0 for background, 1 for object
-    """
-    mask = tf.reduce_sum(rgba, -1) < threshold
-    # invert mask
-    mask = tf.cast(mask, tf.float32)
-    mask = 1. - mask
-
-    return mask
-
-
 def train():
 
     parser = config_parser()
@@ -632,10 +654,9 @@ def train():
         print('Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
-        #! re what is the unit?
-        #! should be in meters, floowing blender convention.
-        near = .2
-        far = 1.
+
+        near = 2.
+        far = 6.
 
         if args.white_bkgd:
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
@@ -728,7 +749,6 @@ def train():
     global_step.assign(start)
 
     # Prepare raybatch tensor if batching random rays
-    #!Re emit rays here.
     N_rand = args.N_rand
     use_batching = not args.no_batching
     if use_batching:
@@ -743,14 +763,9 @@ def train():
         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
         # for each pixel in the image. This stack() adds a new dimension.
         rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
-        # [N, ro+rd, H, W, 3] (!Re [N, 2, H, W, 3])
-        rays = np.stack(rays, axis=0)
+        rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
         print('done, concats')
         # [N, ro+rd+rgb, H, W, 3]
-        #! Re associate rays with rgb.
-        #! 2X upsample images to match rays dimensions.
-        images = np.stack([np.repeat(np.repeat(images, 2, axis=0), 2, axis=1)])
-
         rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
         # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
@@ -798,8 +813,8 @@ def train():
             # Random from one image
             img_i = np.random.choice(i_train)
             target = images[img_i]
-            target_mask = gen_mask(target, 4-1e-3)
             pose = poses[img_i, :3, :4]
+
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, focal, pose)
                 if i < args.precrop_iters:
@@ -822,29 +837,22 @@ def train():
                 rays_d = tf.gather_nd(rays_d, select_inds)
                 batch_rays = tf.stack([rays_o, rays_d], 0)
                 target_s = tf.gather_nd(target, select_inds)
-                target_mask_s = tf.gather_nd(target_mask, select_inds)
 
         #####  Core optimization loop  #####
-        #!Re define loss coefficient
-        l_rgb = 0.5
-        l_struct = 1.-l_rgb
+
         with tf.GradientTape() as tape:
 
             # Make predictions for color, disparity, accumulated opacity.
-
             rgb, disp, acc, extras = render(
                 H, W, focal, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
-
+            #! rgb, disp.. :[N_rays, 3] ie, evaluated as ray batches
             # Compute MSE loss between predicted and true RGB.
-            # img_loss = img2mse(rgb, target_s)
-            rgb_loss = tf.reduce_mean(tf.square(rgb - target_s))
-            struct_loss = tf.reduce_mean(tf.square(acc - target_mask_s))
-
-            trans = extras['raw'][..., -1]
-            # loss = l_rgb*rgb_loss + l_struct*struct_loss
-            loss = rgb_loss
-            psnr = mse2psnr(rgb_loss)
+            # ! calculated per-ray, not per-image
+            img_loss = img2mse(rgb, target_s)
+            trans = extras['raw'][..., -1]  # !transparency
+            loss = img_loss
+            psnr = mse2psnr(img_loss)
 
             # Add MSE loss for coarse-grained model
             if 'rgb0' in extras:
@@ -884,7 +892,6 @@ def train():
                              to8b(disps / np.max(disps)), fps=30, quality=8)
 
             if args.use_viewdirs:
-                #! Re use the same poses for the viewdirs
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
                 rgbs_still, _ = render_path(
                     render_poses, hwf, args.chunk, render_kwargs_test)
@@ -914,7 +921,7 @@ def train():
 
             if i % args.i_img == 0:
 
-                # Log a rendered validation view t  o Tensorboard
+                # Log a rendered validation view to Tensorboard
                 img_i = np.random.choice(i_val)
                 target = images[img_i]
                 pose = poses[img_i, :3, :4]

@@ -93,7 +93,7 @@ def render_rays(ray_batch,
         """Transforms model's predictions to semantically meaningful values.
 
         Args:
-          raw: [num_rays, num_samples along ray, 4]. Prediction from model.
+          ! raw: [num_rays, num_samples along ray, 7]. Prediction from model.
           z_vals: [num_rays, num_samples along ray]. Integration time.
           rays_d: [num_rays, 3]. Direction of each ray.
 
@@ -108,6 +108,12 @@ def render_rays(ray_batch,
         # strictly between [0, 1].
         def raw2alpha(raw, dists, act_fn=tf.nn.relu): return 1.0 - \
             tf.exp(-act_fn(raw) * dists)
+
+        def raw2norm(raw):
+            """
+            return normalized normal vector
+            """
+            return raw / tf.norm(raw, axis=-1, keepdims=True)
 
         # Compute 'distance' (in time) between each integration time along a ray.
         dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -155,11 +161,15 @@ def render_rays(ray_batch,
         # Sum of weights along each ray. This value is in [0, 1] up to numerical error.
         acc_map = tf.reduce_sum(weights, -1)
 
+        #! norm
+        norm = raw[..., 4:7]
+        norm = raw2norm(norm)
+
         # To composite onto a white background, use the accumulated alpha map.
         if white_bkgd:
             rgb_map = rgb_map + (1.-acc_map[..., None])
 
-        return rgb_map, disp_map, acc_map, weights, depth_map
+        return rgb_map, disp_map, acc_map, weights, depth_map, norm
 
     ###############################
     # batch size
@@ -186,7 +196,7 @@ def render_rays(ray_batch,
         # Sample linearly in inverse depth (disparity).
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
     z_vals = tf.broadcast_to(z_vals, [N_rays, N_samples])
-    #! Re sample pts along each ray.
+
     # Perturb sampling time along each ray.
     if perturb > 0.:
         # get intervals between samples
@@ -202,9 +212,13 @@ def render_rays(ray_batch,
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
 
     # Evaluate model at each point.
-    #! Re inference here
-    raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
+    # ! [N_rays, N_samples, 7]
+    raw = network_query_fn(pts, viewdirs, network_fn)
+    #! Re compute gradient
+    acc = raw[..., 3]
+    with tf.GradientTape() as tape:
+        grad = tf.gradients(acc, pts)
+    rgb_map, disp_map, acc_map, weights, depth_map, norm = raw2outputs(
         raw, z_vals, rays_d)
 
     if N_importance > 0:
@@ -225,10 +239,11 @@ def render_rays(ray_batch,
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(
+        rgb_map, disp_map, acc_map, weights, depth_map, norm = raw2outputs(
             raw, z_vals, rays_d)
 
-    ret = {'rgb_map': rgb_map, 'disp_map': disp_map, 'acc_map': acc_map}
+    ret = {'rgb_map': rgb_map, 'disp_map': disp_map,
+           'acc_map': acc_map, 'norm': norm, 'grad': grad}
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -277,7 +292,7 @@ def render(H, W, focal,
       near: float or array of shape [batch_size]. Nearest distance for a ray.
       far: float or array of shape [batch_size]. Farthest distance for a ray.
       use_viewdirs: bool. If True, use viewing direction of a point in space in model.
-      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for
+      c2w_staticcam: array of shape [3, 4]. If not None, use this transformation matrix for 
        camera while using other c2w argument for viewing directions.
 
     Returns:
@@ -298,7 +313,6 @@ def render(H, W, focal,
         # provide ray directions as input
         viewdirs = rays_d
         if c2w_staticcam is not None:
-            #! Re what is it
             # special case to visualize effect of viewdirs
             rays_o, rays_d = get_rays(H, W, focal, c2w_staticcam)
 
@@ -331,7 +345,7 @@ def render(H, W, focal,
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = tf.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    k_extract = ['rgb_map', 'disp_map', 'acc_map', 'norm', 'grad']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
@@ -349,16 +363,17 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     rgbs = []
     disps = []
+    norms = []
 
     t = time.time()
     for i, c2w in enumerate(render_poses):
-        #! Re for each of the poses to render
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _ = render(
+        rgb, disp, acc, _, norm = render(
             H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.numpy())
         disps.append(disp.numpy())
+        norms.append(norm.numpy())
         if i == 0:
             print(rgb.shape, disp.shape)
 
@@ -370,11 +385,12 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
             imageio.imwrite(filename, rgb8)
-    #! Re prediction for each poses
+
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
+    norms = np.stack(norms, 0)
 
-    return rgbs, disps
+    return rgbs, disps, norms
 
 
 def create_nerf(args):
@@ -447,7 +463,7 @@ def create_nerf(args):
     if len(ckpts) > 0 and not args.no_reload:
         ft_weights = ckpts[-1]
         print('Reloading from', ft_weights)
-        model.set_weights(np.load(ft_weights, allow_pickle=True))
+#         model.set_weights(np.load(ft_weights, allow_pickle=True))
         start = int(ft_weights[-10:-4]) + 1
         print('Resetting step to', start)
 
@@ -455,7 +471,7 @@ def create_nerf(args):
             ft_weights_fine = '{}_fine_{}'.format(
                 ft_weights[:-11], ft_weights[-10:])
             print('Reloading fine from', ft_weights_fine)
-            model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
+#             model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, models
 
@@ -574,18 +590,6 @@ def config_parser():
     return parser
 
 
-def gen_mask(rgba, threshold: float = 0.01):
-    """genearate object mask for img of [H, W, 4], assuming rgba is in [0, 1], and the background is pure white
-      return a mask of [H, W], 0 from 0~1, 0 for background, 1 for object
-    """
-    mask = tf.reduce_sum(rgba, -1) < threshold
-    # invert mask
-    mask = tf.cast(mask, tf.float32)
-    mask = 1. - mask
-
-    return mask
-
-
 def train():
 
     parser = config_parser()
@@ -632,10 +636,9 @@ def train():
         print('Loaded blender', images.shape,
               render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
-        #! re what is the unit?
-        #! should be in meters, floowing blender convention.
-        near = .2
-        far = 1.
+
+        near = 2.
+        far = 6.
 
         if args.white_bkgd:
             images = images[..., :3]*images[..., -1:] + (1.-images[..., -1:])
@@ -708,8 +711,8 @@ def train():
         os.makedirs(testsavedir, exist_ok=True)
         print('test poses shape', render_poses.shape)
 
-        rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
-                              gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+        rgbs, _, __ = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
+                                  gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
         print('Done rendering', testsavedir)
         imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'),
                          to8b(rgbs), fps=30, quality=8)
@@ -728,7 +731,6 @@ def train():
     global_step.assign(start)
 
     # Prepare raybatch tensor if batching random rays
-    #!Re emit rays here.
     N_rand = args.N_rand
     use_batching = not args.no_batching
     if use_batching:
@@ -743,14 +745,9 @@ def train():
         # get_rays_np() returns rays_origin=[H, W, 3], rays_direction=[H, W, 3]
         # for each pixel in the image. This stack() adds a new dimension.
         rays = [get_rays_np(H, W, focal, p) for p in poses[:, :3, :4]]
-        # [N, ro+rd, H, W, 3] (!Re [N, 2, H, W, 3])
-        rays = np.stack(rays, axis=0)
+        rays = np.stack(rays, axis=0)  # [N, ro+rd, H, W, 3]
         print('done, concats')
         # [N, ro+rd+rgb, H, W, 3]
-        #! Re associate rays with rgb.
-        #! 2X upsample images to match rays dimensions.
-        images = np.stack([np.repeat(np.repeat(images, 2, axis=0), 2, axis=1)])
-
         rays_rgb = np.concatenate([rays, images[:, None, ...]], 1)
         # [N, H, W, ro+rd+rgb, 3]
         rays_rgb = np.transpose(rays_rgb, [0, 2, 3, 1, 4])
@@ -798,8 +795,8 @@ def train():
             # Random from one image
             img_i = np.random.choice(i_train)
             target = images[img_i]
-            target_mask = gen_mask(target, 4-1e-3)
             pose = poses[img_i, :3, :4]
+
             if N_rand is not None:
                 rays_o, rays_d = get_rays(H, W, focal, pose)
                 if i < args.precrop_iters:
@@ -822,29 +819,23 @@ def train():
                 rays_d = tf.gather_nd(rays_d, select_inds)
                 batch_rays = tf.stack([rays_o, rays_d], 0)
                 target_s = tf.gather_nd(target, select_inds)
-                target_mask_s = tf.gather_nd(target_mask, select_inds)
 
         #####  Core optimization loop  #####
-        #!Re define loss coefficient
-        l_rgb = 0.5
-        l_struct = 1.-l_rgb
+
         with tf.GradientTape() as tape:
 
             # Make predictions for color, disparity, accumulated opacity.
-
-            rgb, disp, acc, extras = render(
+            rgb, disp, acc, norm, grad, extras = render(
                 H, W, focal, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
 
             # Compute MSE loss between predicted and true RGB.
-            # img_loss = img2mse(rgb, target_s)
-            rgb_loss = tf.reduce_mean(tf.square(rgb - target_s))
-            struct_loss = tf.reduce_mean(tf.square(acc - target_mask_s))
-
+            img_loss = img2mse(rgb, target_s)
+            # l2 loss between norm and grad
+            norm_loss = tf.reduce_mean(tf.square(norm - grad))
             trans = extras['raw'][..., -1]
-            # loss = l_rgb*rgb_loss + l_struct*struct_loss
-            loss = rgb_loss
-            psnr = mse2psnr(rgb_loss)
+            loss = img_loss + 0.01 * norm_loss
+            psnr = mse2psnr(img_loss)
 
             # Add MSE loss for coarse-grained model
             if 'rgb0' in extras:
@@ -873,7 +864,7 @@ def train():
 
         if i % args.i_video == 0 and i > 0:
 
-            rgbs, disps = render_path(
+            rgbs, disps, __ = render_path(
                 render_poses, hwf, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(
@@ -884,9 +875,8 @@ def train():
                              to8b(disps / np.max(disps)), fps=30, quality=8)
 
             if args.use_viewdirs:
-                #! Re use the same poses for the viewdirs
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
-                rgbs_still, _ = render_path(
+                rgbs_still, _, __ = render_path(
                     render_poses, hwf, args.chunk, render_kwargs_test)
                 render_kwargs_test['c2w_staticcam'] = None
                 imageio.mimwrite(moviebase + 'rgb_still.mp4',
@@ -914,7 +904,7 @@ def train():
 
             if i % args.i_img == 0:
 
-                # Log a rendered validation view t  o Tensorboard
+                # Log a rendered validation view to Tensorboard
                 img_i = np.random.choice(i_val)
                 target = images[img_i]
                 pose = poses[img_i, :3, :4]
