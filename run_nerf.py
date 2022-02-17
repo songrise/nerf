@@ -16,6 +16,8 @@ os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 tf.compat.v1.enable_eager_execution()
 
 
+
+
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches."""
     if chunk is None:
@@ -37,10 +39,12 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
         input_dirs_flat = tf.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
         embedded = tf.concat([embedded, embedded_dirs], -1)
-
+    # with tf.GradientTape() as t:
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = tf.reshape(outputs_flat, list(
         inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    # rgb = outputs[...,:2]
+    # grad = t.gradient(rgb,embedded)
     return outputs
 
 
@@ -93,7 +97,7 @@ def render_rays(ray_batch,
         """Transforms model's predictions to semantically meaningful values.
 
         Args:
-          ! raw: [num_rays, num_samples along ray, 7]. Prediction from model.
+          raw: [num_rays, num_samples along ray, 4]. Prediction from model.
           z_vals: [num_rays, num_samples along ray]. Integration time.
           rays_d: [num_rays, 3]. Direction of each ray.
 
@@ -108,12 +112,6 @@ def render_rays(ray_batch,
         # strictly between [0, 1].
         def raw2alpha(raw, dists, act_fn=tf.nn.relu): return 1.0 - \
             tf.exp(-act_fn(raw) * dists)
-
-        def raw2norm(raw):
-            """
-            return normalized normal vector
-            """
-            return raw / tf.norm(raw, axis=-1, keepdims=True)
 
         # Compute 'distance' (in time) between each integration time along a ray.
         dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -140,6 +138,10 @@ def render_rays(ray_batch,
         # higher likelihood of being absorbed at this point.
         alpha = raw2alpha(raw[..., 3] + noise, dists)  # [N_rays, N_samples]
 
+        norm = raw[..., 4:]  # [N_rays, N_samples, 3]
+        # norm = tf.keras.activations.tanh(norm)
+        # nomalize normal vectors
+        norm = tf.math.l2_normalize(norm, axis=-1)
         # Compute weight for RGB of each sample along each ray.  A cumprod() is
         # used to express the idea of the ray not having reflected up to this
         # sample yet.
@@ -161,15 +163,11 @@ def render_rays(ray_batch,
         # Sum of weights along each ray. This value is in [0, 1] up to numerical error.
         acc_map = tf.reduce_sum(weights, -1)
 
-        #! norm
-        norm = raw[..., 4:7]
-        norm = raw2norm(norm)
-
         # To composite onto a white background, use the accumulated alpha map.
         if white_bkgd:
             rgb_map = rgb_map + (1.-acc_map[..., None])
 
-        return rgb_map, disp_map, acc_map, weights, depth_map, norm
+        return rgb_map, disp_map, acc_map, weights, depth_map, norm, alpha
 
     ###############################
     # batch size
@@ -210,19 +208,16 @@ def render_rays(ray_batch,
     # Points in space to evaluate model at.
     pts = rays_o[..., None, :] + rays_d[..., None, :] * \
         z_vals[..., :, None]  # [N_rays, N_samples, 3]
+    #! points evaluated for the course network
+    pts0 = pts
 
     # Evaluate model at each point.
-    # ! [N_rays, N_samples, 7]
-    raw = network_query_fn(pts, viewdirs, network_fn)
-    #! Re compute gradient
-    acc = raw[..., 3]
-    with tf.GradientTape() as tape:
-        grad = tf.gradients(acc, pts)
-    rgb_map, disp_map, acc_map, weights, depth_map, norm = raw2outputs(
+    raw = network_query_fn(pts, viewdirs, network_fn)  # [N_rays, N_samples, 4]
+    rgb_map, disp_map, acc_map, weights, depth_map, norm, alpha = raw2outputs(
         raw, z_vals, rays_d)
 
     if N_importance > 0:
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        rgb_map_0, disp_map_0, acc_map_0, norm_0, alpha_0 = rgb_map, disp_map, acc_map, norm, alpha
 
         # Obtain additional integration times to evaluate based on the weights
         # assigned to colors in the coarse model.
@@ -235,22 +230,23 @@ def render_rays(ray_batch,
         z_vals = tf.sort(tf.concat([z_vals, z_samples], -1), -1)
         pts = rays_o[..., None, :] + rays_d[..., None, :] * \
             z_vals[..., :, None]  # [N_rays, N_samples + N_importance, 3]
-
+        pts = tf.Variable(pts, dtype=tf.float32)
         # Make predictions with network_fine.
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
-        rgb_map, disp_map, acc_map, weights, depth_map, norm = raw2outputs(
+        rgb_map, disp_map, acc_map, weights, depth_map, norm, alpha = raw2outputs(
             raw, z_vals, rays_d)
 
     ret = {'rgb_map': rgb_map, 'disp_map': disp_map,
-           'acc_map': acc_map, 'norm': norm, 'grad': grad}
-    if retraw:
+           'acc_map': acc_map, 'pts': pts, 'norm': norm, 'weights': weights, 'alpha': alpha}
+    if 1:  # ! always return raw
         ret['raw'] = raw
     if N_importance > 0:
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['z_std'] = tf.math.reduce_std(z_samples, -1)  # [N_rays]
+        ret['pts0'] = pts0
 
     for k in ret:
         tf.debugging.check_numerics(ret[k], 'output {}'.format(k))
@@ -267,9 +263,13 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
             if k not in all_ret:
                 all_ret[k] = []
             all_ret[k].append(ret[k])
-
-    all_ret = {k: tf.concat(all_ret[k], 0) for k in all_ret}
-    return all_ret
+    ret = {}
+    for k in all_ret:
+        if k != 'pts':
+            ret[k] = tf.concat(all_ret[k], 0)
+        else:
+            ret[k] = all_ret[k][0]
+    return ret
 
 
 def render(H, W, focal,
@@ -343,9 +343,11 @@ def render(H, W, focal,
     all_ret = batchify_rays(rays, chunk, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = tf.reshape(all_ret[k], k_sh)
+        if k != 'pts':
+            all_ret[k] = tf.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map', 'norm', 'grad']
+    k_extract = ['rgb_map', 'disp_map', 'acc_map',
+                 'pts', 'norm', 'weights', 'alpha']
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k: all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
@@ -363,17 +365,15 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     rgbs = []
     disps = []
-    norms = []
 
     t = time.time()
     for i, c2w in enumerate(render_poses):
         print(i, time.time() - t)
         t = time.time()
-        rgb, disp, acc, _, norm = render(
+        rgb, disp, acc, pts, norm, weight, alpha, _ = render(
             H, W, focal, chunk=chunk, c2w=c2w[:3, :4], **render_kwargs)
         rgbs.append(rgb.numpy())
         disps.append(disp.numpy())
-        norms.append(norm.numpy())
         if i == 0:
             print(rgb.shape, disp.shape)
 
@@ -388,9 +388,8 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
     rgbs = np.stack(rgbs, 0)
     disps = np.stack(disps, 0)
-    norms = np.stack(norms, 0)
 
-    return rgbs, disps, norms
+    return rgbs, disps
 
 
 def create_nerf(args):
@@ -463,7 +462,8 @@ def create_nerf(args):
     if len(ckpts) > 0 and not args.no_reload:
         ft_weights = ckpts[-1]
         print('Reloading from', ft_weights)
-#         model.set_weights(np.load(ft_weights, allow_pickle=True))
+        #! temp disabled for experiment
+        # model.set_weights(np.load(ft_weights, allow_pickle=True))
         start = int(ft_weights[-10:-4]) + 1
         print('Resetting step to', start)
 
@@ -471,7 +471,8 @@ def create_nerf(args):
             ft_weights_fine = '{}_fine_{}'.format(
                 ft_weights[:-11], ft_weights[-10:])
             print('Reloading fine from', ft_weights_fine)
-#             model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
+            #! temp disabled for experiment
+            # model_fine.set_weights(np.load(ft_weights_fine, allow_pickle=True))
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, models
 
@@ -480,7 +481,7 @@ def config_parser():
 
     import configargparse
     parser = configargparse.ArgumentParser()
-    parser.add_argument('--config', is_config_file=True,
+    parser.add_argument('--config', default='config_my.txt', is_config_file=True,
                         help='config file path')
     parser.add_argument("--expname", type=str, help='experiment name')
     parser.add_argument("--basedir", type=str, default='./logs/',
@@ -711,8 +712,8 @@ def train():
         os.makedirs(testsavedir, exist_ok=True)
         print('test poses shape', render_poses.shape)
 
-        rgbs, _, __ = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
-                                  gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
+        rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test,
+                              gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
         print('Done rendering', testsavedir)
         imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'),
                          to8b(rgbs), fps=30, quality=8)
@@ -822,22 +823,46 @@ def train():
 
         #####  Core optimization loop  #####
 
-        with tf.GradientTape() as tape:
+        with tf.GradientTape(persistent=True) as tape:
 
             # Make predictions for color, disparity, accumulated opacity.
-            rgb, disp, acc, norm, grad, extras = render(
+            rgb, disp, acc, pts, norm, weight, alpha, extras = render(
                 H, W, focal, chunk=args.chunk, rays=batch_rays,
                 verbose=i < 10, retraw=True, **render_kwargs_train)
+            tape.watch(pts)
+            tape.watch(alpha)
+            # compute the gradient of alpha wrt the pts
+            grad = tape.gradient(alpha, pts)
+            grad = tf.stop_gradient(grad)  # [Nrays,Nsamples,3]
+
+            tf.debugging.check_numerics(grad, 'grad')
+            # normalize the gradient
+            grad = tf.math.l2_normalize(grad, axis=-1)
 
             # Compute MSE loss between predicted and true RGB.
             img_loss = img2mse(rgb, target_s)
-            # l2 loss between norm and grad
-            norm_loss = tf.reduce_mean(tf.square(norm - grad))
+            # Compute weighted loss (reg term) between norm and grad
+            # copy the last dim of weight 3 times
+            # todo check this reg term
+            # # l1 normalization of weight
+            # weight_reg = tf.reduce_mean(tf.abs(weight))
+            weight = tf.stop_gradient(weight)
+            #[Nray, Nsamples, 3], first weighted sum on last dim
+            tf.debugging.check_numerics(norm, 'norm')
+            tf.debugging.check_numerics(grad, 'grad')
+            norm_loss = tf.reduce_sum(tf.square(norm - grad), axis=-1)
+            norm_loss = weight*norm_loss
+            norm_loss = tf.reduce_sum(norm_loss,-1)
+            norm_loss = tf.reduce_sum(norm_loss,-1)
+            tf.debugging.check_numerics(norm_loss, 'norm_loss contains nan')
+
             trans = extras['raw'][..., -1]
-            loss = img_loss + 0.01 * norm_loss
+            #! reg coeff follow refnerf
+            loss = img_loss + 0.0003*norm_loss
             psnr = mse2psnr(img_loss)
 
             # Add MSE loss for coarse-grained model
+            #! temp not implemented
             if 'rgb0' in extras:
                 img_loss0 = img2mse(extras['rgb0'], target_s)
                 loss += img_loss0
@@ -864,7 +889,7 @@ def train():
 
         if i % args.i_video == 0 and i > 0:
 
-            rgbs, disps, __ = render_path(
+            rgbs, disps = render_path(
                 render_poses, hwf, args.chunk, render_kwargs_test)
             print('Done, saving', rgbs.shape, disps.shape)
             moviebase = os.path.join(
@@ -876,7 +901,7 @@ def train():
 
             if args.use_viewdirs:
                 render_kwargs_test['c2w_staticcam'] = render_poses[0][:3, :4]
-                rgbs_still, _, __ = render_path(
+                rgbs_still, _ = render_path(
                     render_poses, hwf, args.chunk, render_kwargs_test)
                 render_kwargs_test['c2w_staticcam'] = None
                 imageio.mimwrite(moviebase + 'rgb_still.mp4',
@@ -897,21 +922,27 @@ def train():
             print('iter time {:.05f}'.format(dt))
             with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
                 tf.contrib.summary.scalar('loss', loss)
+                tf.contrib.summary.scalar('norm loss', norm_loss.numpy())
                 tf.contrib.summary.scalar('psnr', psnr)
                 tf.contrib.summary.histogram('tran', trans)
                 if args.N_importance > 0:
                     tf.contrib.summary.scalar('psnr0', psnr0)
 
             if i % args.i_img == 0:
-
+            # if True:
                 # Log a rendered validation view to Tensorboard
                 img_i = np.random.choice(i_val)
                 target = images[img_i]
                 pose = poses[img_i, :3, :4]
 
-                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                **render_kwargs_test)
-
+                rgb, disp, acc, pts, norm, weight, alpha, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                                          **render_kwargs_test)
+                print(norm[200:220,200:220,:])
+                #todo check here
+                # [H, W, nSample] -> [H, W, nSample, 3]
+                weight = tf.tile(weight[..., tf.newaxis], [1, 1, 1, 3])
+                # [H,W, nSample, 3] -> [H, W, 3]; weighted sum along ray
+                norm = tf.reduce_sum(weight*norm, -2)
                 psnr = mse2psnr(img2mse(rgb, target))
 
                 # Save out the validation image for Tensorboard-free monitoring
@@ -920,6 +951,8 @@ def train():
                     os.makedirs(testimgdir, exist_ok=True)
                 imageio.imwrite(os.path.join(
                     testimgdir, '{:06d}.png'.format(i)), to8b(rgb))
+                imageio.imwrite(os.path.join(
+                    testimgdir, '{:06d}_norm.png'.format(i)), to8b_vec(norm))
 
                 with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
 
@@ -931,6 +964,8 @@ def train():
 
                     tf.contrib.summary.scalar('psnr_holdout', psnr)
                     tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
+                    tf.contrib.summary.image('pred norm', to8b_vec(norm)[tf.newaxis])
+
 
                 if args.N_importance > 0:
 
@@ -941,6 +976,7 @@ def train():
                             'disp0', extras['disp0'][tf.newaxis, ..., tf.newaxis])
                         tf.contrib.summary.image(
                             'z_std', extras['z_std'][tf.newaxis, ..., tf.newaxis])
+
 
         global_step.assign_add(1)
 

@@ -40,7 +40,8 @@ model = get_model()
 # model.summary()
 gradVar = model.trainable_variables
 # random generate data of [N,3]
-input_ = tf.Variable(np.random.rand(10, 3), dtype=tf.float32)
+input_ = tf.random.normal(shape=(10, 3))
+input_var = tf.Variable(input_)
 gt_out = tf.Variable(np.array([[0.0], [1.0], [4.0], [9.0]]), dtype=tf.float32)
 # gt_inter = tf.Variable(np.array([[1.0, 1.0, 1.0]], dtype=np.float32))
 # duplicate gt_inter to [N,3]

@@ -24,7 +24,6 @@ class Embedder:
     #! Re should be the \gamma for positional encoding?
 
     def __init__(self, **kwargs):
-
         self.kwargs = kwargs
         self.create_embedding_fn()
 
@@ -244,6 +243,15 @@ def mse2psnr(x): return -10.*tf.log(x)/tf.log(10.)
 def to8b(x): return (255*np.clip(x, 0, 1)).astype(np.uint8)
 
 
+def to8b_vec(x):
+    """"
+    Encode vector in [-1,1] in to 8 bit color space
+    """
+    x = np.clip(x, -1, 1)
+    x = (255*(x + 1)/2).astype(np.uint8)
+    return x
+
+
 # Positional encoding
 
 class Embedder:
@@ -409,7 +417,6 @@ class SphericalBasis(tf.keras.Model):
 #     return model
 
 
-
 # modified architecture v2
 def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
     #!Re see p.18 of the paper for the model architecture
@@ -423,8 +430,12 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
 
     inputs = tf.keras.Input(shape=(input_ch + input_ch_views))
     inputs_pts, inputs_views = tf.split(inputs, [input_ch, input_ch_views], -1)
+    #! assume the embedding always keeps raw input in first 3 elem
+    input_views_raw, input_views_embedded = tf.split(
+        inputs_views, [3, input_ch_views-3], -1)
     inputs_pts.set_shape([None, input_ch])
-    inputs_views.set_shape([None, input_ch_views])
+    input_views_raw.set_shape([None, 3])
+    input_views_embedded.set_shape([None, input_ch_views-3])
 
     print(inputs.shape, inputs_pts.shape, inputs_views.shape)
     outputs = inputs_pts
@@ -436,29 +447,29 @@ def init_nerf_model(D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips
     if use_viewdirs:
         #! Re modified this following NeX and refNerf
         alpha_out = dense(1, act=None)(outputs)
-        diffuse_out = dense(3, act=None)(outputs)
+        # diffuse_out = dense(3, act='sigmoid')(outputs)
+        norm_outputs = dense(3, act=None)(outputs)  # pred normal
         bottleneck = dense(256, act=None)(outputs)
 
+        # compute the angle between the view direction and the normal
+        nDotv = tf.reduce_sum(norm_outputs * input_views_raw, axis=-1)
+        nDotv = tf.expand_dims(nDotv, -1)
         inputs_viewdirs = tf.concat(
-            [bottleneck, inputs_views], -1)  # concat viewdirs
+            [bottleneck, norm_outputs, nDotv, input_views_embedded], -1)  # concat viewdirs
         outputs = inputs_viewdirs
         # The supplement to the paper states there are 4 hidden layers here, but this is an error since
         # the experiments were actually run with 1 hidden layer, so we will leave it as 1.
         outputs = dense(W//2)(outputs)
-        isOutline = dense(1, act='sigmoid')(outputs)
-        isOutline = tf.pow(isOutline, 6)
-        # threshold = tf.Variable(0.5, dtype=tf.float32)
-        # isOutline = tf.cast(isOutline > 0.5, tf.float32)
+        outputs = dense(W//2)(outputs)
+        #! use tanh to express the idea that specular could be black
+        #! Feb 3. modified back to vanilla nerf
+        rgb_outputs = dense(3, act=None)(outputs)
+        # isOutline = tf.pow(isOutline, 6)
 
-        # outputs = dense(n_order, act=None)(outputs)  # coeff
-        # basis = SphericalBasis(n_order, input_ch_views)
-        # specular_out = basis(inputs_views, coeff=outputs)  # specular
-        # pure black
-        # specular_out = tf.constant([0, 0, 0], dtype=tf.float32)
-        # if it is not outline, not affected
-        outputs = (1-isOutline)*diffuse_out
+        # rgb_outputs = diffuse_out + specular_out
         # specular_out  # diffuse + specular
-        outputs = tf.concat([outputs, alpha_out], -1)  # !Re rgb+a
+        # !Re rgb+a+norm, 7 channels
+        outputs = tf.concat([rgb_outputs, alpha_out, norm_outputs], -1)
     else:
         outputs = dense(output_ch, act=None)(outputs)
 
